@@ -1,298 +1,379 @@
-import yfinance as yf
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-from scipy.optimize import minimize
-from sklearn.metrics import r2_score
+import os
+import tempfile
 import warnings
-warnings.filterwarnings('ignore')
+
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "matplotlib"))
+
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from scipy.optimize import minimize
+
+warnings.filterwarnings("ignore")
 
 # ============================================================
-# 1. DATA INGESTION — Extended BIS-Aligned Basket (10 pairs)
+# Shadow S$NEER proxy
 # ============================================================
-# MAS's actual basket is undisclosed, but BIS data points to these
-# top trading partners for Singapore. SGD is the NUMERAIRE,
-# so we express all rates as SGD per foreign unit (inverted from X quotes).
-pairs = {
-    "SGDUSD=X": "USD",
-    "SGDCNY=X": "CNY",
-    "SGDMYR=X": "MYR",
-    "SGDEUR=X": "EUR",
-    "SGDJPY=X": "JPY",
-    "SGDKRW=X": "KRW",
-    "SGDGBP=X": "GBP",
-    "SGDAUD=X": "AUD",
-    "SGDTHB=X": "THB",
-    "SGDINR=X": "INR",
+# MAS does not disclose the official S$NEER basket, weights, centre, slope, or
+# band width. This script therefore builds a transparent proxy from observable
+# SGD crosses and explicit approximate trade/competition weights.
+#
+# Yahoo Finance tickers below are quoted as foreign currency per SGD
+# (for example SGDUSD=X ~= USD per SGD). A rise therefore means SGD strength.
+
+START_DATE = "2022-01-01"
+OUTPUT_FILE = "sgd_neer_dashboard.png"
+
+POLICY_CHANGE = pd.Timestamp("2026-04-14")
+
+# Approximate proxy weights. These are intentionally explicit and normalized
+# again in code. Treat them as a modelling input, not an official MAS basket.
+PROXY_BASKET = {
+    "SGDUSD=X": ("USD", 0.170),
+    "SGDCNY=X": ("CNY", 0.205),
+    "SGDMYR=X": ("MYR", 0.125),
+    "SGDEUR=X": ("EUR", 0.105),
+    "SGDJPY=X": ("JPY", 0.070),
+    "SGDKRW=X": ("KRW", 0.060),
+    "SGDTWD=X": ("TWD", 0.055),
+    "SGDIDR=X": ("IDR", 0.050),
+    "SGDTHB=X": ("THB", 0.045),
+    "SGDAUD=X": ("AUD", 0.040),
+    "SGDINR=X": ("INR", 0.040),
+    "SGDGBP=X": ("GBP", 0.035),
 }
 
-print("Downloading FX data...")
-raw = yf.download(list(pairs.keys()), start="2022-01-01", progress=False)['Close']
-raw.columns = [pairs[col] for col in raw.columns]
+# Analyst-style policy slope assumptions for the illustrative centre line.
+# MAS's public wording on 14 Apr 2026 was that it would increase the rate of
+# appreciation slightly while keeping width and centre unchanged.
+SLOPE_BEFORE_POLICY_CHANGE = 0.005  # 0.5% p.a. proxy
+SLOPE_AFTER_POLICY_CHANGE = 0.010   # 1.0% p.a. proxy
+FIXED_BAND = 0.02                   # ±2% proxy commonly used by market analysts
 
-# Forward-fill weekends/holidays, then drop any remaining NaNs
-data = raw.ffill().dropna()
 
-# Log returns: ln(P_t / P_{t-1})
-# Under the NEER framework, a RISE in SGD/FCU means SGD WEAKENED against that currency.
-# We invert so that a positive log-return = SGD appreciating vs that currency.
-log_ret = -np.log(data / data.shift(1)).dropna()  # Negated: positive = SGD strength
+def r2_score_np(actual, fitted):
+    actual = np.asarray(actual, dtype=float)
+    fitted = np.asarray(fitted, dtype=float)
+    mask = np.isfinite(actual) & np.isfinite(fitted)
+    actual = actual[mask]
+    fitted = fitted[mask]
+    if len(actual) < 2:
+        return np.nan
+    ss_res = np.sum((actual - fitted) ** 2)
+    ss_tot = np.sum((actual - actual.mean()) ** 2)
+    return 1 - ss_res / ss_tot if ss_tot else np.nan
 
-print(f"Data loaded: {len(data)} trading days, {len(data.columns)} currency pairs")
-print(f"Date range: {data.index[0].date()} → {data.index[-1].date()}")
 
-# ============================================================
-# 2. REVERSE-ENGINEERING ENGINE — Rolling Constrained OLS
-# ============================================================
-# Window = 252 trading days (1 year)
-# Constraint: weights ≥ 0, sum to 1 (no short-selling, no leverage)
-# Method: SLSQP (Sequential Least Squares Programming)
+def normalize_weights(basket):
+    weights = pd.Series({ccy: weight for _, (ccy, weight) in basket.items()})
+    return weights / weights.sum()
 
-window = 252
 
-base_currency = 'USD'
-cols = log_ret.drop(columns=[base_currency]).columns.tolist()   # 9 currencies (excl. USD)
-x_full = log_ret[cols].values
-y_full = log_ret[base_currency].values   # y = SGD/USD; x = other 9 currencies
-dates = log_ret.index[window:]
+def download_sgd_crosses(basket):
+    tickers = list(basket.keys())
+    labels = {ticker: ccy for ticker, (ccy, _) in basket.items()}
 
-n_currencies = len(cols)
-constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
-bounds = [(0.0, 1.0)] * n_currencies
-w0 = np.array([1.0 / n_currencies] * n_currencies)
-
-print(f"\nRunning rolling constrained OLS over {len(dates)} windows...")
-rolling_weights = []
-
-for i in range(len(dates)):
-    x_win = x_full[i: i + window]
-    y_win = y_full[i: i + window]
-    res = minimize(
-        lambda w: np.sum((y_win - x_win @ w) ** 2),
-        w0,
-        method='SLSQP',
-        bounds=bounds,
-        constraints=constraints,
-        options={'ftol': 1e-9, 'maxiter': 500}
+    print("Downloading SGD FX crosses from Yahoo Finance...")
+    downloaded = yf.download(
+        tickers,
+        start=START_DATE,
+        progress=False,
+        auto_adjust=False,
+        group_by="column",
+        threads=False,
+        timeout=30,
     )
-    rolling_weights.append(res.x)
-    if (i + 1) % 100 == 0:
-        print(f"  {i + 1}/{len(dates)} windows done...")
 
-weights_df = pd.DataFrame(rolling_weights, index=dates, columns=cols)
-print("Rolling optimization complete.")
+    if isinstance(downloaded.columns, pd.MultiIndex):
+        if "Close" not in downloaded.columns.get_level_values(0):
+            raise RuntimeError("Yahoo response did not include Close prices.")
+        raw = downloaded["Close"].copy()
+    else:
+        raw = downloaded[["Close"]].copy()
+        raw.columns = tickers
 
-# ============================================================
-# 3. SHADOW NEER INDEX CONSTRUCTION
-# ============================================================
-# Reconstruct the NEER as a weighted sum of log returns, then exponentiate
-dynamic_ret = np.array([
-    x_full[window + i] @ rolling_weights[i] for i in range(len(dates))
-])
-neer_series = pd.Series(
-    np.exp(np.cumsum(dynamic_ret)) * 100,
-    index=dates,
-    name="Shadow_NEER"
-)
+    raw = raw.rename(columns=labels)
+    raw = raw.reindex(columns=list(labels.values()))
 
-# ============================================================
-# 4. ROLLING VOLATILITY (Phase 3 — Missing from original)
-# ============================================================
-# 21-day rolling annualised vol of the NEER log-returns
-neer_log_ret = np.log(neer_series / neer_series.shift(1)).dropna()
-rolling_vol = neer_log_ret.rolling(21).std() * np.sqrt(252) * 100  # annualised, in %
+    missing = raw.columns[raw.isna().all()].tolist()
+    if missing:
+        raise RuntimeError(f"No price history returned for: {', '.join(missing)}")
 
-# Dynamic band width: ±(1.5 × 30-day rolling vol), floored at ±0.5%
-band_half_width = (neer_log_ret.rolling(30).std() * np.sqrt(30) * 1.5 * 100).clip(lower=0.5)
+    gap_ratio = raw.isna().mean().sort_values(ascending=False)
+    data = raw.ffill().dropna()
 
-# ============================================================
-# 5. MAS POLICY BAND TRACKER
-# ============================================================
-policy_change = pd.Timestamp('2026-04-14')
+    if len(data) < 260:
+        raise RuntimeError("Not enough overlapping data to build a stable index.")
 
-# MAS policy: the band's CENTRE appreciates at a controlled slope.
-# Before Apr 14 2026: ~1.5% p.a. slope (pre-tightening regime)
-# After Apr 14 2026: ~2.0% p.a. slope (tightened to combat imported inflation)
-# We optimise the starting anchor so the centre best fits the market NEER.
+    return data, gap_ratio
 
-def build_policy_center(anchor_val):
-    anchor = float(np.atleast_1d(anchor_val)[0])
-    centers = np.empty(len(dates))
-    centers[0] = anchor
-    for k in range(1, len(dates)):
-        slope = 0.020 / 252 if dates[k] >= policy_change else 0.015 / 252
-        centers[k] = centers[k - 1] * (1 + slope)
-    return centers
 
-opt_res = minimize(
-    lambda a: np.sum((neer_series.values - build_policy_center(a)) ** 2),
-    x0=[neer_series.iloc[0]],
-    method='Nelder-Mead'
-)
-smooth_center = build_policy_center(opt_res.x)
+def build_shadow_neer(data, weights):
+    log_levels = np.log(data)
+    base = log_levels.iloc[0]
+    weighted_log_index = (log_levels.subtract(base) * weights).sum(axis=1)
+    index = np.exp(weighted_log_index) * 100
+    index.name = "Shadow_NEER"
 
-# MAS uses a fixed ±2% statutory band; we also show a vol-dynamic band
-fixed_band = 0.02
-final_df = pd.DataFrame({
-    'NEER': neer_series,
-    'Center': smooth_center,
-    'Upper_Fixed': smooth_center * (1 + fixed_band),
-    'Lower_Fixed': smooth_center * (1 - fixed_band),
-}, index=dates)
+    component_returns = np.log(data / data.shift(1)).dropna()
+    weighted_returns = component_returns.mul(weights, axis=1).sum(axis=1)
+    weighted_returns.name = "Shadow_NEER_Log_Return"
+    return index, weighted_returns, component_returns
 
-# Add dynamic (vol-adjusted) bands where vol data is available
-final_df['Vol_BandWidth'] = band_half_width.reindex(dates)
-final_df['Upper_Dynamic'] = final_df['Center'] * (1 + final_df['Vol_BandWidth'] / 100)
-final_df['Lower_Dynamic'] = final_df['Center'] * (1 - final_df['Vol_BandWidth'] / 100)
 
-r2 = r2_score(final_df['NEER'], final_df['Center'])
+def build_policy_center(index):
+    dates = index.index
 
-# ============================================================
-# 6. KRW/SGD CORRELATION SPOTLIGHT (Korea-Singapore Trade Link)
-# SGD/USD actual price series (reindexed to NEER dates for comparison)
-sgdusd = data['USD'].reindex(dates)
-# Normalise to same base as NEER (value at first date = 100)
-sgdusd_norm = sgdusd / sgdusd.iloc[0] * 100
+    def center_from_anchor(anchor_val):
+        anchor = float(np.atleast_1d(anchor_val)[0])
+        centers = np.empty(len(dates))
+        centers[0] = anchor
+        for i in range(1, len(dates)):
+            slope = (
+                SLOPE_AFTER_POLICY_CHANGE
+                if dates[i] >= POLICY_CHANGE
+                else SLOPE_BEFORE_POLICY_CHANGE
+            )
+            days = max((dates[i] - dates[i - 1]).days, 1)
+            centers[i] = centers[i - 1] * np.exp(slope * days / 365.25)
+        return centers
 
-# Latest snapshot
-latest_weights = weights_df.iloc[-1].sort_values(ascending=False)
-print(f"\n{'='*55}")
-print("SHADOW BASKET — LATEST WEIGHTS")
-print('='*55)
-for ccy, wt in latest_weights.items():
-    bar = '█' * int(wt * 40)
-    print(f"  {ccy:>4s}  {wt:6.2%}  {bar}")
+    opt = minimize(
+        lambda anchor: np.sum((index.values - center_from_anchor(anchor)) ** 2),
+        x0=[index.iloc[0]],
+        method="Nelder-Mead",
+        options={"maxiter": 5000},
+    )
+    return pd.Series(center_from_anchor(opt.x), index=dates, name="Estimated_Center"), opt
 
-print(f"\nOptimised Anchor:  {opt_res.x[0]:.4f}")
-print(f"R² (Center vs Market NEER):  {r2:.4f}")
-print(f"Current Rolling Vol (21d ann.):  {rolling_vol.iloc[-1]:.2f}%")
-print(f"Latest SGD/USD: {sgdusd.iloc[-1]:.4f}")
 
-# ============================================================
-# 7. PROFESSIONAL 4-PANEL VISUALIZATION
-# ============================================================
-plt.style.use('dark_background')
-fig = plt.figure(figsize=(18, 14))
-fig.patch.set_facecolor('#0d0d1a')
+def latest_snapshot(index, returns, center, weights, data, gap_ratio):
+    latest_date = index.index[-1].date()
+    latest_gap = ((index.iloc[-1] / center.iloc[-1]) - 1) * 100
+    latest_vol = returns.rolling(21).std().iloc[-1] * np.sqrt(252) * 100
 
-gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35,
-                       left=0.07, right=0.97, top=0.93, bottom=0.06)
+    print(f"\n{'=' * 62}")
+    print("SHADOW S$NEER PROXY - LATEST SNAPSHOT")
+    print("=" * 62)
+    print(f"Date: {latest_date}")
+    print(f"Index: {index.iloc[-1]:.3f}")
+    print(f"Estimated centre: {center.iloc[-1]:.3f}")
+    print(f"Distance from estimated centre: {latest_gap:+.2f}%")
+    print(f"21d annualised volatility: {latest_vol:.2f}%")
+    print(f"Latest USD per SGD: {data['USD'].iloc[-1]:.4f}")
 
-ax_neer   = fig.add_subplot(gs[0, :])
-ax_weight = fig.add_subplot(gs[1, :])
-ax_vol    = fig.add_subplot(gs[2, 0])
+    print(f"\n{'=' * 62}")
+    print("PROXY BASKET WEIGHTS")
+    print("=" * 62)
+    for ccy, weight in weights.sort_values(ascending=False).items():
+        bar = "#" * int(round(weight * 60))
+        print(f"  {ccy:>4s}  {weight:6.2%}  {bar}")
 
-gs_corr = gridspec.GridSpecFromSubplotSpec(
-    2, 1, subplot_spec=gs[2, 1],
-    height_ratios=[0.68, 0.32], hspace=0.08
-)
-ax_corr = fig.add_subplot(gs_corr[0])
-ax_dev  = fig.add_subplot(gs_corr[1], sharex=ax_corr)
+    notable_gaps = gap_ratio[gap_ratio > 0.01]
+    if not notable_gaps.empty:
+        print("\nData gaps forward-filled before overlap trimming:")
+        for ccy, ratio in notable_gaps.items():
+            print(f"  {ccy:>4s}: {ratio:.1%}")
 
-TEAL   = '#00d4b4'
-ORANGE = '#ff7043'
-RED    = '#ef5350'
-GREEN  = '#66bb6a'
-GOLD   = '#ffd54f'
-WHITE  = '#e8eaf6'
-BG     = '#0d0d1a'
-PANEL  = '#141428'
 
-def style_ax(ax, title):
-    ax.set_facecolor(PANEL)
-    ax.set_title(title, color=WHITE, fontsize=11, fontweight='bold', pad=8)
-    ax.tick_params(colors='#8888aa', labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color('#2a2a4a')
-    ax.grid(True, color='#1e1e3a', linewidth=0.5, alpha=0.8)
+def plot_dashboard(data, index, returns, component_returns, center, weights):
+    fixed_upper = center * (1 + FIXED_BAND)
+    fixed_lower = center * (1 - FIXED_BAND)
 
-# --- Panel 1: Shadow NEER + Policy Band ---
-style_ax(ax_neer, f"Shadow S$NEER Policy Tracker  |  R² = {r2:.4f}  |  Basket: {len(cols)+1} Currencies")
+    rolling_vol = returns.rolling(21).std() * np.sqrt(252) * 100
+    dynamic_half_width = (
+        returns.rolling(30).std() * np.sqrt(30) * 1.5 * 100
+    ).clip(lower=0.5)
+    dynamic_upper = center * (1 + dynamic_half_width / 100)
+    dynamic_lower = center * (1 - dynamic_half_width / 100)
+    center_r2 = r2_score_np(index, center)
 
-ax_neer.fill_between(dates, final_df['Lower_Fixed'], final_df['Upper_Fixed'],
-                     color='#ffffff', alpha=0.03, label='Fixed ±2% MAS Band')
-ax_neer.fill_between(dates, final_df['Lower_Dynamic'], final_df['Upper_Dynamic'],
-                     color=TEAL, alpha=0.08, label='Vol-Dynamic Band (±1.5σ)')
-ax_neer.plot(final_df['NEER'],    color=TEAL,   lw=1.8, label='Shadow S$NEER')
-ax_neer.plot(final_df['Center'],  color=WHITE,  lw=1.2, ls=':', alpha=0.6, label='Policy Centre')
-ax_neer.plot(final_df['Upper_Fixed'], color=RED,   lw=0.8, ls='--', alpha=0.5, label='Upper +2%')
-ax_neer.plot(final_df['Lower_Fixed'], color=GREEN, lw=0.8, ls='--', alpha=0.5, label='Lower -2%')
-ax_neer.axvline(policy_change, color=ORANGE, lw=1.8, ls='-',
-                label='MAS Tightening (Apr 14 2026)', zorder=5)
-ax_neer.annotate('MAS Slope\n+0.5pp', xy=(policy_change, ax_neer.get_ylim()[1] if ax_neer.get_ylim()[1] != 0 else 105),
-                 xytext=(15, -30), textcoords='offset points',
-                 color=ORANGE, fontsize=8, arrowprops=dict(arrowstyle='->', color=ORANGE, lw=0.8))
-ax_neer.legend(loc='upper left', fontsize=7.5, framealpha=0.2, ncol=3)
-ax_neer.set_ylabel('Index (Base = 100)', color='#8888aa', fontsize=9)
+    contribution_63d = component_returns.mul(weights, axis=1).rolling(63).sum() * 100
+    usd_per_sgd = data["USD"].reindex(index.index)
+    usd_per_sgd_norm = usd_per_sgd / usd_per_sgd.iloc[0] * 100
+    deviation = (index / center - 1) * 100
+    latest_contrib = contribution_63d.iloc[-1].sort_values()
+    latest_gap = deviation.iloc[-1]
+    latest_vol = rolling_vol.iloc[-1]
+    latest_date = index.index[-1].strftime("%d %b %Y")
 
-# --- Panel 2: Dynamic Basket Weights ---
-style_ax(ax_weight, "Reverse-Engineered Shadow Basket Weights (Rolling 252-Day Constrained OLS)")
+    plt.style.use("dark_background")
+    fig = plt.figure(figsize=(18, 12))
+    fig.patch.set_facecolor("#0f1318")
 
-cmap = plt.cm.get_cmap('tab10', len(cols))
-colors = [cmap(i) for i in range(len(cols))]
-ax_weight.stackplot(dates, weights_df.T.values, labels=cols,
-                    colors=colors, alpha=0.9)
-ax_weight.axvline(policy_change, color=ORANGE, lw=1.5, ls='-')
-ax_weight.set_ylabel('Weight', color='#8888aa', fontsize=9)
-ax_weight.legend(loc='upper left', fontsize=7.5, framealpha=0.2, ncol=5)
-ax_weight.set_ylim(0, 1)
-ax_weight.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.0%}'))
+    grid = gridspec.GridSpec(
+        3,
+        2,
+        figure=fig,
+        height_ratios=[1.35, 1.0, 1.0],
+        hspace=0.46,
+        wspace=0.22,
+        left=0.055,
+        right=0.965,
+        top=0.79,
+        bottom=0.075,
+    )
 
-# --- Panel 3: Rolling NEER Volatility ---
-style_ax(ax_vol, "Rolling NEER Volatility (21-Day, Annualised)")
-ax_vol.fill_between(rolling_vol.index, rolling_vol, color=TEAL, alpha=0.3)
-ax_vol.plot(rolling_vol, color=TEAL, lw=1.2)
-ax_vol.axvline(policy_change, color=ORANGE, lw=1.5, ls='-')
-ax_vol.set_ylabel('Vol %', color='#8888aa', fontsize=9)
-ax_vol.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f'{v:.1f}%'))
+    ax_neer = fig.add_subplot(grid[0, :])
+    ax_weights = fig.add_subplot(grid[1, 0])
+    ax_contrib = fig.add_subplot(grid[1, 1])
+    ax_vol = fig.add_subplot(grid[2, 0])
+    ax_compare = fig.add_subplot(grid[2, 1])
 
-# --- Panel 4: SGD/USD vs Shadow NEER + Deviation ---
-deviation = sgdusd_norm - final_df['NEER']   # +ve = market above policy implied (SGD overvalued)
+    teal = "#15c8b5"
+    orange = "#ff9f43"
+    red = "#f06565"
+    green = "#62d394"
+    gold = "#f4c95d"
+    white = "#e7edf5"
+    muted = "#9aa6b6"
+    panel = "#171c24"
+    grid_color = "#2b3340"
 
-style_ax(ax_corr, "SGD/USD vs Shadow NEER  |  Market vs Policy-Implied Level")
-ax_corr.plot(sgdusd_norm,      color=GOLD, lw=1.4, label='SGD/USD (Normalised)')
-ax_corr.plot(final_df['NEER'], color=TEAL, lw=1.4, alpha=0.85, label='Shadow NEER (Policy-Implied)')
-# Shading: above = SGD stronger than policy implies (green), below = weaker (red)
-ax_corr.fill_between(dates, sgdusd_norm, final_df['NEER'],
-                     where=sgdusd_norm >= final_df['NEER'],
-                     color=GREEN, alpha=0.15, label='Above implied (SGD strong)')
-ax_corr.fill_between(dates, sgdusd_norm, final_df['NEER'],
-                     where=sgdusd_norm < final_df['NEER'],
-                     color=RED, alpha=0.15, label='Below implied (SGD weak)')
-ax_corr.axvline(policy_change, color=ORANGE, lw=1.5, ls='-')
-ax_corr.set_ylabel('Index (Base=100)', color='#8888aa', fontsize=8)
-ax_corr.legend(loc='upper right', fontsize=6.5, framealpha=0.2, ncol=2)
-ax_corr.tick_params(labelbottom=False)   # hide x-ticks, shared with ax_dev
+    def style_ax(ax, title):
+        ax.set_facecolor(panel)
+        ax.set_title(title, color=white, fontsize=11, fontweight="bold", pad=10)
+        ax.tick_params(colors=muted, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color("#323b49")
+        ax.grid(True, color=grid_color, linewidth=0.55, alpha=0.7)
 
-# Deviation subplot
-style_ax(ax_dev, "")
-ax_dev.set_facecolor('#141428')
-ax_dev.axhline(0, color='#555577', lw=0.8)
-ax_dev.fill_between(dates, deviation, 0,
-                    where=deviation >= 0, color=GREEN, alpha=0.5)
-ax_dev.fill_between(dates, deviation, 0,
-                    where=deviation < 0,  color=RED,   alpha=0.5)
-ax_dev.plot(deviation, color=WHITE, lw=0.7, alpha=0.6)
-ax_dev.axvline(policy_change, color=ORANGE, lw=1.5, ls='-')
-ax_dev.set_ylabel('Deviation', color='#8888aa', fontsize=7)
-ax_dev.tick_params(colors='#8888aa', labelsize=7)
-for spine in ax_dev.spines.values():
-    spine.set_color('#2a2a4a')
-ax_dev.grid(True, color='#1e1e3a', linewidth=0.5, alpha=0.8)
-# Annotate current deviation
-cur_dev = deviation.iloc[-1]
-ax_dev.annotate(f'{cur_dev:+.2f}', xy=(deviation.index[-1], cur_dev),
-                xytext=(-35, 8 if cur_dev < 0 else -14), textcoords='offset points',
-                color=GREEN if cur_dev >= 0 else RED, fontsize=7, fontweight='bold')
+    def add_kpi(x, label, value, subtext, accent):
+        fig.text(x, 0.925, label.upper(), color=muted, fontsize=7.5, fontweight="bold")
+        fig.text(x, 0.898, value, color=white, fontsize=15, fontweight="bold")
+        fig.text(x, 0.875, subtext, color=accent, fontsize=8, fontweight="bold")
 
-# --- Master title ---
-fig.suptitle(
-    "S$NEER Shadow Model  ·  Open-Source Replication of MAS Monetary Policy",
-    color=WHITE, fontsize=15, fontweight='bold', y=0.97
-)
+    fig.text(
+        0.055,
+        0.975,
+        "S$NEER Shadow Proxy",
+        color=white,
+        fontsize=18,
+        fontweight="bold",
+    )
+    fig.text(
+        0.055,
+        0.948,
+        "Trade-weighted proxy. MAS basket, centre and band are undisclosed.",
+        color=muted,
+        fontsize=9,
+    )
+    add_kpi(0.055, "Latest date", latest_date, "Yahoo FX closes", teal)
+    add_kpi(0.22, "Proxy index", f"{index.iloc[-1]:.2f}", "Jan 2022 = 100", teal)
+    add_kpi(
+        0.385,
+        "Vs centre",
+        f"{latest_gap:+.2f}%",
+        "above estimate" if latest_gap >= 0 else "below estimate",
+        green if latest_gap >= 0 else red,
+    )
+    add_kpi(0.55, "21d vol", f"{latest_vol:.2f}%", "annualised", gold)
 
-plt.savefig('sgd_neer_dashboard.png', dpi=150, bbox_inches='tight',
-            facecolor=fig.get_facecolor())
-print("\nChart saved → sgd_neer_dashboard.png")
-plt.show()
+    style_ax(
+        ax_neer,
+        f"Proxy Path vs Estimated Policy Band | Centre Fit R2 = {center_r2:.3f}",
+    )
+    ax_neer.fill_between(
+        index.index,
+        fixed_lower,
+        fixed_upper,
+        color="#dbe4ee",
+        alpha=0.05,
+        label="Estimated fixed band (+/-2%)",
+    )
+    ax_neer.fill_between(
+        index.index,
+        dynamic_lower,
+        dynamic_upper,
+        color=teal,
+        alpha=0.075,
+        label="Vol-adjusted stress band",
+    )
+    ax_neer.plot(index, color=teal, lw=2.1, label="Shadow S$NEER proxy")
+    ax_neer.plot(center, color=white, lw=1.25, ls=":", alpha=0.8, label="Estimated centre")
+    ax_neer.plot(fixed_upper, color=red, lw=0.85, ls="--", alpha=0.55)
+    ax_neer.plot(fixed_lower, color=green, lw=0.85, ls="--", alpha=0.55)
+    ax_neer.axvline(POLICY_CHANGE, color=orange, lw=1.4, label="MAS slope increase (14 Apr 2026)")
+    ax_neer.scatter(index.index[-1], index.iloc[-1], s=34, color=teal, edgecolor=white, linewidth=0.8, zorder=5)
+    ax_neer.annotate(
+        f"{index.iloc[-1]:.2f}",
+        xy=(index.index[-1], index.iloc[-1]),
+        xytext=(-48, 14),
+        textcoords="offset points",
+        color=white,
+        fontsize=8.5,
+        fontweight="bold",
+        arrowprops=dict(arrowstyle="-", color=teal, lw=0.8),
+    )
+    ax_neer.set_ylabel("Index, Jan 2022 = 100", color=muted, fontsize=9)
+    ax_neer.legend(loc="upper left", fontsize=7.5, framealpha=0.18, ncol=4)
+
+    style_ax(ax_weights, "Explicit Proxy Basket Weights")
+    sorted_weights = weights.sort_values()
+    bar_colors = [teal if value < sorted_weights.max() else gold for value in sorted_weights.values]
+    ax_weights.barh(sorted_weights.index, sorted_weights.values, color=bar_colors, alpha=0.9)
+    for y, value in enumerate(sorted_weights.values):
+        ax_weights.text(value + 0.002, y, f"{value:.1%}", color=muted, va="center", fontsize=8)
+    ax_weights.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax_weights.set_xlim(0, max(sorted_weights.max() * 1.22, 0.22))
+
+    style_ax(ax_contrib, "Latest 63-Day Weighted Contributions")
+    contrib_colors = [green if value >= 0 else red for value in latest_contrib.values]
+    ax_contrib.barh(latest_contrib.index, latest_contrib.values, color=contrib_colors, alpha=0.88)
+    ax_contrib.axvline(0, color="#7a8594", lw=0.9)
+    for y, value in enumerate(latest_contrib.values):
+        ha = "left" if value >= 0 else "right"
+        offset = 0.015 if value >= 0 else -0.015
+        ax_contrib.text(value + offset, y, f"{value:+.2f}%", color=muted, va="center", ha=ha, fontsize=8)
+    contrib_limit = max(abs(latest_contrib.min()), abs(latest_contrib.max())) * 1.35
+    ax_contrib.set_xlim(-contrib_limit, contrib_limit)
+    ax_contrib.set_xlabel("Contribution to 63-day proxy return", color=muted, fontsize=8)
+
+    style_ax(ax_vol, "Volatility and Centre Deviation")
+    ax_vol.fill_between(rolling_vol.index, rolling_vol, color=teal, alpha=0.2)
+    ax_vol.plot(rolling_vol, color=teal, lw=1.45, label="21d annualised volatility")
+    ax_vol.plot(deviation.abs(), color=gold, lw=1.25, alpha=0.95, label="Absolute centre deviation")
+    ax_vol.axvline(POLICY_CHANGE, color=orange, lw=1.2)
+    ax_vol.set_ylabel("%", color=muted, fontsize=9)
+    ax_vol.legend(loc="upper left", fontsize=7.5, framealpha=0.18)
+
+    style_ax(ax_compare, "USD per SGD vs Trade-Weighted SGD Proxy")
+    ax_compare.plot(usd_per_sgd_norm, color=gold, lw=1.35, label="USD per SGD, normalized")
+    ax_compare.plot(index, color=teal, lw=1.8, label="Shadow S$NEER proxy")
+    ax_compare.fill_between(index.index, usd_per_sgd_norm, index, color=white, alpha=0.035)
+    ax_compare.axvline(POLICY_CHANGE, color=orange, lw=1.2)
+    ax_compare.set_ylabel("Index, Jan 2022 = 100", color=muted, fontsize=9)
+    ax_compare.legend(loc="upper left", fontsize=7.5, framealpha=0.18)
+
+    fig.text(
+        0.055,
+        0.03,
+        "Method: geometric weighted average of observable SGD crosses. "
+        "MAS basket, weights, centre, slope and band width are undisclosed; policy band shown is an analyst-style estimate.",
+        color=muted,
+        fontsize=8,
+    )
+
+    plt.savefig(OUTPUT_FILE, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    print(f"\nChart saved -> {OUTPUT_FILE}")
+    plt.show()
+
+
+def main():
+    weights = normalize_weights(PROXY_BASKET)
+    data, gap_ratio = download_sgd_crosses(PROXY_BASKET)
+    index, returns, component_returns = build_shadow_neer(data, weights)
+    center, opt = build_policy_center(index)
+
+    print(f"Data loaded: {len(data)} observations, {len(data.columns)} SGD crosses")
+    print(f"Date range: {data.index[0].date()} -> {data.index[-1].date()}")
+    print(f"Policy-centre anchor optimisation success: {opt.success}")
+
+    latest_snapshot(index, returns, center, weights, data, gap_ratio)
+    plot_dashboard(data, index, returns, component_returns, center, weights)
+
+
+if __name__ == "__main__":
+    main()
