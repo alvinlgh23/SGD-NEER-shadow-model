@@ -1,4 +1,4 @@
-<img width="2048" height="1280" alt="Preview" src="https://github.com/user-attachments/assets/dc84400f-8d88-4e86-9e5b-924080a59968" />
+<img width="1440" height="900" alt="Screenshot 2026-05-12 at 3 10 20 PM" src="https://github.com/user-attachments/assets/743114f3-195f-4e4a-9d9b-127576dba812" />
 
 # SGD-NEER-shadow-model
 
