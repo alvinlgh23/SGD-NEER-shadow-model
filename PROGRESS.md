@@ -89,6 +89,6 @@ python3 -m http.server 8765 --directory docs
 然后打开 http://localhost:8765。
 
 **还没做的：**
-- 还没 commit 和 push
+- 已 commit（b96c3d0），还没 push
 - GitHub Pages 要你自己开启
 - 2026 年 7 月那次 MAS 调整，以及"Late Jan 2027"这个下次声明日期，都还需要核实
