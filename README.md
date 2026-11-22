@@ -100,3 +100,14 @@ Outputs:
 
 - `sgd_neer_dashboard.png`: the index against the policy band
 - `sgd_basket_inference.png`: rolling weights, OLS intervals, and slope cross-check
+
+## Static deployment
+
+The static deployment bundle lives in `public-site/`.
+
+Cloudflare Pages settings:
+
+- Build command: none
+- Build output directory: `public-site`
+
+The public site serves `index.html`, `sgd_neer_dashboard.png`, and `Preview.png`.
