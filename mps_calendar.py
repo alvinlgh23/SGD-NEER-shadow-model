@@ -61,3 +61,7 @@ MPS_EVENTS = [
 
 # Slope assumed before the first event in the calendar (flat band from 2020).
 INITIAL_SLOPE = 0.0
+
+# Next scheduled review, shown on the dashboard. MAS publishes its review
+# calendar in advance; confirm the exact date on mas.gov.sg.
+NEXT_REVIEW_LABEL = "Late Jan 2027"

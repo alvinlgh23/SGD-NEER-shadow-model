@@ -1,4 +1,6 @@
-<img width="2048" height="1280" alt="Preview" src="https://github.com/user-attachments/assets/dc84400f-8d88-4e86-9e5b-924080a59968" />
+![S$NEER shadow dashboard](sgd_neer_dashboard.png)
+
+![Basket inference](sgd_basket_inference.png)
 
 # SGD-NEER-shadow-model
 
@@ -8,6 +10,28 @@ MAS manages the Singapore dollar against an undisclosed trade-weighted basket
 (the S$NEER), inside an undisclosed policy band whose slope, width and centre
 it adjusts in its Monetary Policy Statements. This project tries to
 reverse-engineer both from public FX data.
+
+## Interactive dashboard
+
+`docs/` holds a static web page with an interactive version of the model:
+
+- switch between basket-weight modes
+- change the band width
+- edit the slope of each MAS policy move
+- every number and chart updates live
+
+The page recomputes the policy band in the browser. On load it checks its
+result against the Python numbers stored in `docs/data.json`, and logs the
+outcome to the console.
+
+- **Refresh the data:** `python3 export_web.py`, which writes `docs/data.json`.
+- **Preview locally:** `python3 -m http.server 8765 --directory docs`, then
+  open http://localhost:8765.
+- **Publish:** in GitHub, go to *Settings → Pages → Deploy from a branch* and
+  choose `main` with the `/docs` folder.
+- **Daily refresh:** `.github/workflows/update-data.yml` runs on weekdays. It
+  runs the tests, re-exports the data, and commits `docs/data.json` when the
+  data changed. It can also be started by hand from the *Actions* tab.
 
 ## What it does
 

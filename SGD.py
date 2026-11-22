@@ -11,7 +11,7 @@ import pandas as pd
 import yfinance as yf
 
 from basket_inference import infer_basket
-from mps_calendar import INITIAL_SLOPE, MPS_EVENTS
+from mps_calendar import INITIAL_SLOPE, MPS_EVENTS, NEXT_REVIEW_LABEL
 from policy_band import band_diagnostics, build_piecewise_center, implied_regime_slopes, slope_schedule
 
 warnings.filterwarnings("ignore")
@@ -196,17 +196,19 @@ def latest_snapshot(index, returns, center, weights, assumed, inference, regimes
 PALETTE = {
     "teal": "#15c8b5", "orange": "#ff9f43", "red": "#f06565", "green": "#62d394",
     "gold": "#f4c95d", "white": "#e7edf5", "muted": "#9aa6b6", "panel": "#171c24",
-    "grid": "#2b3340", "bg": "#0f1318",
+    "grid": "#2b3340", "bg": "#0f1318", "edge": "#b8c4d4", "band": "#5b7fa6",
 }
-SERIES_COLORS = ["#15c8b5", "#f4c95d", "#ff9f43", "#8fa8ff", "#f06565", "#62d394",
-                 "#c58cf0", "#9aa6b6"]
+LINE_COLORS = ["#15c8b5", "#f4c95d", "#8fa8ff", "#ff9f43", "#c58cf0"]
+EVENT_TAGS = {"slope_up": "↑ slope", "slope_down": "↓ slope", "recentre": "re-centre"}
 
 
-def style_ax(ax, title):
+def style_ax(ax, title, subtitle=None):
     p = PALETTE
     ax.set_facecolor(p["panel"])
-    ax.set_title(title, color=p["white"], fontsize=11, fontweight="bold", pad=10)
-    ax.tick_params(colors=p["muted"], labelsize=8)
+    ax.set_title(title, color=p["white"], fontsize=12, fontweight="bold", pad=22 if subtitle else 10, loc="left")
+    if subtitle:
+        ax.text(0, 1.02, subtitle, transform=ax.transAxes, color=p["muted"], fontsize=9, va="bottom")
+    ax.tick_params(colors=p["muted"], labelsize=9)
     for spine in ax.spines.values():
         spine.set_color("#323b49")
     ax.grid(True, color=p["grid"], linewidth=0.55, alpha=0.7)
@@ -217,183 +219,240 @@ def band_changes_in(index):
             if e.action != "hold" and index.index[0] <= e.date <= index.index[-1]]
 
 
-def mark_policy_events(ax, index, label=True):
-    events = band_changes_in(index)
-    for i, ev in enumerate(events):
-        color = PALETTE["gold"] if ev.action == "recentre" else PALETTE["orange"]
-        ax.axvline(ev.date, color=color, lw=1.0, alpha=0.7, ls="-" if ev.verified else ":",
-                   label="MAS band change (dotted = unverified)" if label and i == 0 else None)
+def mark_policy_events(ax, index, tags=False):
+    """Vertical lines at band changes; optional short labels along the top edge."""
+    p = PALETTE
+    for i, ev in enumerate(band_changes_in(index)):
+        color = p["gold"] if ev.action == "recentre" else p["orange"]
+        ax.axvline(ev.date, color=color, lw=1.0, alpha=0.55, ls="-" if ev.verified else ":", zorder=1)
+        if tags:
+            text = f"{ev.date:%b %y}\n{EVENT_TAGS[ev.action]}" + ("" if ev.verified else "\n(unverified)")
+            ax.annotate(text, xy=(ev.date, 1.0), xycoords=("data", "axes fraction"),
+                        xytext=(3, -6 - 26 * (i % 2)), textcoords="offset points",
+                        color=color, fontsize=8, va="top", ha="left", linespacing=1.05)
+
+
+def band_zone(gap_pct):
+    half = FIXED_BAND * 100
+    if gap_pct > half:
+        return "above the estimated band"
+    if gap_pct >= 0:
+        return "in the upper half of the band"
+    if gap_pct >= -half:
+        return "in the lower half of the band"
+    return "below the estimated band"
+
+
+def current_slope(index):
+    return slope_schedule(index.index[-1:], MPS_EVENTS, INITIAL_SLOPE).iloc[0]
 
 
 def plot_dashboard(data, index, returns, component_returns, center, weights, assumed, band):
     p = PALETTE
-    fixed_upper = center * (1 + FIXED_BAND)
-    fixed_lower = center * (1 - FIXED_BAND)
-    rolling_vol = returns.rolling(21).std() * np.sqrt(252) * 100
+    half = FIXED_BAND * 100
+    upper = center * (1 + FIXED_BAND)
+    lower = center * (1 - FIXED_BAND)
+    deviation = band["deviation"]
+    gap = band["latest_deviation_pct"]
+    slope_now = current_slope(index)
 
     current = latest_weights(weights)
     if isinstance(weights, pd.DataFrame):
         contribution_63d = (component_returns * weights.reindex(component_returns.index)).rolling(63).sum() * 100
     else:
         contribution_63d = component_returns.mul(weights, axis=1).rolling(63).sum() * 100
+    latest_contrib = contribution_63d.iloc[-1].sort_values()
     usd_per_sgd = data["USD"].reindex(index.index)
     usd_per_sgd_norm = usd_per_sgd / usd_per_sgd.iloc[0] * 100
-    deviation = band["deviation"]
-    latest_contrib = contribution_63d.iloc[-1].sort_values()
-    latest_gap = band["latest_deviation_pct"]
-    latest_vol = rolling_vol.iloc[-1]
 
     plt.style.use("dark_background")
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(18, 12.5))
     fig.patch.set_facecolor(p["bg"])
-    grid = gridspec.GridSpec(3, 2, figure=fig, height_ratios=[1.35, 1.0, 1.0], hspace=0.46,
-                             wspace=0.22, left=0.055, right=0.965, top=0.79, bottom=0.075)
+    grid = gridspec.GridSpec(3, 2, figure=fig, height_ratios=[1.45, 1.0, 1.0], hspace=0.55,
+                             wspace=0.2, left=0.055, right=0.965, top=0.79, bottom=0.07)
     ax_neer = fig.add_subplot(grid[0, :])
-    ax_weights = fig.add_subplot(grid[1, 0])
-    ax_contrib = fig.add_subplot(grid[1, 1])
-    ax_dev = fig.add_subplot(grid[2, 0])
+    ax_pos = fig.add_subplot(grid[1, 0])
+    ax_weights = fig.add_subplot(grid[1, 1])
+    ax_contrib = fig.add_subplot(grid[2, 0])
     ax_compare = fig.add_subplot(grid[2, 1])
 
-    def add_kpi(x, label, value, subtext, accent):
-        fig.text(x, 0.925, label.upper(), color=p["muted"], fontsize=7.5, fontweight="bold")
-        fig.text(x, 0.898, value, color=p["white"], fontsize=15, fontweight="bold")
-        fig.text(x, 0.875, subtext, color=accent, fontsize=8, fontweight="bold")
+    # Headline: the finding first, method second.
+    fig.text(0.055, 0.972, f"The Singapore dollar is {band_zone(gap)} ({gap:+.1f}% vs estimated centre)",
+             color=p["white"], fontsize=20, fontweight="bold")
+    fig.text(0.055, 0.945,
+             f"Shadow S$NEER from FX data as of {index.index[-1]:%d %b %Y}. MAS keeps its basket, band and slope "
+             "undisclosed; everything shown is an estimate.", color=p["muted"], fontsize=10)
 
-    fig.text(0.055, 0.975, "S$NEER Shadow Proxy", color=p["white"], fontsize=18, fontweight="bold")
-    fig.text(0.055, 0.948,
-             f"Basket weights inferred from FX data ({WEIGHT_MODE}); band follows the MAS policy-statement calendar. "
-             "MAS basket, centre, slope and width are undisclosed.",
-             color=p["muted"], fontsize=9)
-    add_kpi(0.055, "Latest date", index.index[-1].strftime("%d %b %Y"), "Yahoo FX closes", p["teal"])
-    add_kpi(0.22, "Proxy index", f"{index.iloc[-1]:.2f}", f"{index.index[0]:%b %Y} = 100", p["teal"])
-    in_band = abs(latest_gap) <= FIXED_BAND * 100
-    add_kpi(0.385, "Vs centre", f"{latest_gap:+.2f}%",
-            ("upper half" if latest_gap >= 0 else "lower half") if in_band else "outside est. band",
-            p["green"] if in_band else p["red"])
-    add_kpi(0.55, "Days outside band", f"{band['share_outside_band']:.0%}", f"of sample, +/-{FIXED_BAND:.0%}", p["gold"])
-    add_kpi(0.715, "21d vol", f"{latest_vol:.2f}%", "annualised", p["gold"])
+    in_band = abs(gap) <= half
+    kpis = [
+        ("Position vs centre", f"{gap:+.2f}%", f"band estimated at +/-{half:.0f}%", p["green"] if in_band else p["red"]),
+        ("Room to upper edge", f"{half - gap:.2f}%", "before est. ceiling" if gap <= half else "already above",
+         p["teal"] if gap <= half else p["red"]),
+        ("Estimated slope", f"{slope_now:.2f}% p.a.", "pace of allowed appreciation", p["gold"]),
+        ("Days outside band", f"{band['share_outside_band']:.0%}", f"since {index.index[0]:%b %Y}, model check", p["muted"]),
+        ("Next MAS review", NEXT_REVIEW_LABEL, "date to confirm on mas.gov.sg", p["muted"]),
+    ]
+    for i, (label, value, sub, accent) in enumerate(kpis):
+        x = 0.055 + i * 0.18
+        fig.text(x, 0.905, label.upper(), color=p["muted"], fontsize=8.5, fontweight="bold")
+        fig.text(x, 0.876, value, color=p["white"], fontsize=17, fontweight="bold")
+        fig.text(x, 0.853, sub, color=accent, fontsize=8.5)
 
-    style_ax(ax_neer, "Proxy Path vs Piecewise Policy Band (re-centres and slope changes from MAS statements)")
-    ax_neer.fill_between(index.index, fixed_lower, fixed_upper, color="#dbe4ee", alpha=0.06,
-                         label=f"Estimated band (+/-{FIXED_BAND:.0%})")
-    ax_neer.plot(index, color=p["teal"], lw=2.1, label="Shadow S$NEER proxy")
-    ax_neer.plot(center, color=p["white"], lw=1.25, ls=":", alpha=0.8, label="Estimated centre")
-    ax_neer.plot(fixed_upper, color=p["red"], lw=0.85, ls="--", alpha=0.55)
-    ax_neer.plot(fixed_lower, color=p["green"], lw=0.85, ls="--", alpha=0.55)
-    mark_policy_events(ax_neer, index)
-    ax_neer.scatter(index.index[-1], index.iloc[-1], s=34, color=p["teal"], edgecolor=p["white"],
-                    linewidth=0.8, zorder=5)
-    ax_neer.annotate(f"{index.iloc[-1]:.2f}", xy=(index.index[-1], index.iloc[-1]), xytext=(-48, 14),
-                     textcoords="offset points", color=p["white"], fontsize=8.5, fontweight="bold",
-                     arrowprops=dict(arrowstyle="-", color=p["teal"], lw=0.8))
+    # Main chart: corridor, centre, index, outside-band highlight, labelled events.
+    style_ax(ax_neer, "Shadow S$NEER inside the estimated MAS policy band",
+             "Band re-centred and re-sloped on the dates MAS announced; dotted line = unverified event")
+    ax_neer.fill_between(index.index, lower, upper, color=p["band"], alpha=0.22, lw=0, label=f"Estimated band (+/-{half:.0f}%)")
+    ax_neer.plot(upper, color=p["edge"], lw=0.8, alpha=0.6)
+    ax_neer.plot(lower, color=p["edge"], lw=0.8, alpha=0.6)
+    ax_neer.plot(center, color=p["edge"], lw=1.0, ls=":", alpha=0.8, label="Estimated centre")
+    ax_neer.plot(index, color=p["teal"], lw=2.0, label="Shadow S$NEER")
+    outside = deviation.abs() > half
+    ax_neer.plot(index.where(outside), color=p["red"], lw=2.0, label="Outside estimated band")
+    mark_policy_events(ax_neer, index, tags=True)
+    ax_neer.scatter(index.index[-1], index.iloc[-1], s=40, color=p["teal"], edgecolor=p["white"], linewidth=0.9, zorder=5)
+    lo, hi = min(lower.min(), index.min()), max(upper.max(), index.max())
+    ax_neer.set_ylim(lo - 0.5, hi + (hi - lo) * 0.36)  # headroom for event tags
     ax_neer.set_ylabel(f"Index, {index.index[0]:%b %Y} = 100", color=p["muted"], fontsize=9)
-    ax_neer.legend(loc="upper left", fontsize=7.5, framealpha=0.18, ncol=5)
+    ax_neer.legend(loc="lower right", fontsize=8.5, framealpha=0.25, ncol=4)
 
-    style_ax(ax_weights, "Basket Weights: Inferred (latest) vs Hand-Set")
+    # Position within band: one unit, three zones.
+    style_ax(ax_pos, "Where SGD sits inside the band", "Deviation from estimated centre, %")
+    lim = max(3.0, np.ceil(deviation.abs().max()) + 0.5)
+    ax_pos.axhspan(half, lim, color=p["red"], alpha=0.08)
+    ax_pos.axhspan(-lim, -half, color=p["red"], alpha=0.08)
+    ax_pos.axhspan(0, half, color=p["band"], alpha=0.18)
+    ax_pos.axhspan(-half, 0, color=p["band"], alpha=0.08)
+    for y, text in [(half + (lim - half) / 2, "above band"), (half / 2, "upper half"),
+                    (-half / 2, "lower half"), (-half - (lim - half) / 2, "below band")]:
+        ax_pos.text(1.005, y, text, transform=ax_pos.get_yaxis_transform(), color=p["muted"], fontsize=8, va="center")
+    ax_pos.axhline(0, color=p["edge"], lw=0.8, ls=":")
+    ax_pos.plot(deviation, color=p["gold"], lw=1.4)
+    mark_policy_events(ax_pos, index)
+    ax_pos.set_ylim(-lim, lim)
+    ax_pos.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.0f}%"))
+
+    # Basket weights: dumbbell, hand-set vs inferred.
+    style_ax(ax_weights, "What the basket looks like", "Weights inferred from FX data vs a typical hand-set guess")
     order = current.sort_values().index
-    y = np.arange(len(order))
-    ax_weights.barh(y + 0.2, current[order].values, height=0.4, color=p["teal"], alpha=0.9, label="Inferred, used now")
-    ax_weights.barh(y - 0.2, assumed[order].values, height=0.4, color=p["muted"], alpha=0.55, label="Hand-set")
-    for yy, value in zip(y, current[order].values):
-        ax_weights.text(value + 0.002, yy + 0.2, f"{value:.1%}", color=p["muted"], va="center", fontsize=7.5)
-    ax_weights.set_yticks(y, order)
+    yy = np.arange(len(order))
+    ax_weights.hlines(yy, assumed[order], current[order], color=p["muted"], lw=1.2, alpha=0.6)
+    ax_weights.scatter(assumed[order], yy, color=p["muted"], s=28, label="Hand-set guess", zorder=3)
+    ax_weights.scatter(current[order], yy, color=p["teal"], s=42, label="Inferred (latest window)", zorder=4)
+    ax_weights.set_yticks(yy, order)
     ax_weights.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
-    ax_weights.set_xlim(0, max(current.max(), assumed.max()) * 1.25)
-    ax_weights.legend(loc="lower right", fontsize=7.5, framealpha=0.18)
+    ax_weights.set_xlim(0, max(current.max(), assumed.max()) * 1.12)
+    ax_weights.legend(loc="lower right", fontsize=8.5, framealpha=0.25)
 
-    style_ax(ax_contrib, "Latest 63-Day Weighted Contributions")
-    contrib_colors = [p["green"] if v >= 0 else p["red"] for v in latest_contrib.values]
-    ax_contrib.barh(latest_contrib.index, latest_contrib.values, color=contrib_colors, alpha=0.88)
+    style_ax(ax_contrib, "What moved the index in the last 3 months", "Weighted contribution of each currency, %")
+    colors = [p["green"] if v >= 0 else p["red"] for v in latest_contrib.values]
+    ax_contrib.barh(latest_contrib.index, latest_contrib.values, color=colors, alpha=0.88)
     ax_contrib.axvline(0, color="#7a8594", lw=0.9)
-    for yy, value in enumerate(latest_contrib.values):
-        ha, offset = ("left", 0.015) if value >= 0 else ("right", -0.015)
-        ax_contrib.text(value + offset, yy, f"{value:+.2f}%", color=p["muted"], va="center", ha=ha, fontsize=8)
-    contrib_limit = max(abs(latest_contrib.min()), abs(latest_contrib.max()), 0.05) * 1.35
-    ax_contrib.set_xlim(-contrib_limit, contrib_limit)
-    ax_contrib.set_xlabel("Contribution to 63-day proxy return", color=p["muted"], fontsize=8)
+    for y, v in enumerate(latest_contrib.values):
+        ha, off = ("left", 0.015) if v >= 0 else ("right", -0.015)
+        ax_contrib.text(v + off, y, f"{v:+.2f}%", color=p["muted"], va="center", ha=ha, fontsize=8.5)
+    limit = max(abs(latest_contrib.min()), abs(latest_contrib.max()), 0.05) * 1.35
+    ax_contrib.set_xlim(-limit, limit)
+    ax_contrib.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.2f}%"))
+    ax_contrib.text(0.99, 0.02, "SGD stronger vs this currency → positive", transform=ax_contrib.transAxes,
+                    color=p["muted"], fontsize=8, ha="right")
 
-    style_ax(ax_dev, "Deviation from Estimated Centre and Volatility")
-    ax_dev.axhspan(-FIXED_BAND * 100, FIXED_BAND * 100, color="#dbe4ee", alpha=0.05)
-    ax_dev.axhline(0, color="#7a8594", lw=0.8)
-    ax_dev.plot(deviation, color=p["gold"], lw=1.3, label="Deviation from centre, %")
-    ax_dev.plot(rolling_vol, color=p["teal"], lw=1.0, alpha=0.75, label="21d annualised vol, %")
-    mark_policy_events(ax_dev, index, label=False)
-    ax_dev.set_ylabel("%", color=p["muted"], fontsize=9)
-    ax_dev.legend(loc="upper left", fontsize=7.5, framealpha=0.18)
+    style_ax(ax_compare, "Broad SGD strength vs USD/SGD alone",
+             f"Both rebased to 100 in {index.index[0]:%b %Y}; the gap is strength against non-USD currencies")
+    ax_compare.plot(usd_per_sgd_norm, color=p["gold"], lw=1.4, label="USD per SGD")
+    ax_compare.plot(index, color=p["teal"], lw=1.9, label="Shadow S$NEER")
+    ax_compare.legend(loc="upper left", fontsize=8.5, framealpha=0.25)
 
-    style_ax(ax_compare, "USD per SGD vs Trade-Weighted SGD Proxy")
-    ax_compare.plot(usd_per_sgd_norm, color=p["gold"], lw=1.35, label="USD per SGD, normalized")
-    ax_compare.plot(index, color=p["teal"], lw=1.8, label="Shadow S$NEER proxy")
-    ax_compare.fill_between(index.index, usd_per_sgd_norm, index, color=p["white"], alpha=0.035)
-    ax_compare.set_ylabel(f"Index, {index.index[0]:%b %Y} = 100", color=p["muted"], fontsize=9)
-    ax_compare.legend(loc="upper left", fontsize=7.5, framealpha=0.18)
-
-    fig.text(0.055, 0.03,
-             "Method: chain-linked geometric index of SGD crosses; weights from a Frankel-Wei regression (CHF numeraire, weekly returns). "
-             "Band centre: re-centred at prevailing level on MAS re-centring dates, slopes are analyst-style estimates.",
-             color=p["muted"], fontsize=8)
+    fig.text(0.055, 0.025,
+             "Method: chain-linked geometric index of 12 SGD crosses; weights from a rolling Frankel-Wei regression "
+             "(CHF numeraire, weekly returns, lagged). Slopes are analyst-style estimates; event directions follow MAS statements.",
+             color=p["muted"], fontsize=8.5)
     plt.savefig(OUTPUT_FILE, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     print(f"\nChart saved -> {OUTPUT_FILE}")
     return fig
 
 
-def plot_inference(inference, regimes):
+def spread_labels(values, min_gap):
+    """Nudge end-of-line label positions apart so none sit closer than min_gap."""
+    ordered = values.sort_values()
+    positions = ordered.to_numpy(dtype=float).copy()
+    for i in range(1, len(positions)):
+        positions[i] = max(positions[i], positions[i - 1] + min_gap)
+    shift = (positions - ordered.to_numpy()).mean()  # re-centre the group on the data
+    return pd.Series(positions - shift, index=ordered.index)
+
+
+MIN_REGIME_OBS = 120  # shorter regimes give noisy trend estimates
+
+
+def plot_inference(inference, regimes, assumed):
     p = PALETTE
     roll = inference["rolling_weights"]
-    top = roll.mean().sort_values(ascending=False).index[:7]
-    stacked = roll[top].copy()
-    stacked["Other"] = roll.drop(columns=top).sum(axis=1)
+    top = roll.iloc[-1].sort_values(ascending=False).index[:5]
+    ols = inference["ols"].drop(index="const")
+    full = inference["full_weights"]
 
     plt.style.use("dark_background")
-    fig = plt.figure(figsize=(18, 10))
+    fig = plt.figure(figsize=(18, 10.5))
     fig.patch.set_facecolor(p["bg"])
-    grid = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[1.2, 1.0], hspace=0.4, wspace=0.2,
-                             left=0.055, right=0.965, top=0.86, bottom=0.08)
+    grid = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[1.15, 1.0], hspace=0.5, wspace=0.2,
+                             left=0.055, right=0.965, top=0.85, bottom=0.08)
     ax_roll = fig.add_subplot(grid[0, :])
     ax_coef = fig.add_subplot(grid[1, 0])
     ax_slope = fig.add_subplot(grid[1, 1])
 
-    fig.text(0.055, 0.95, "Reverse-Engineering the S$NEER Basket", color=p["white"], fontsize=18, fontweight="bold")
-    fig.text(0.055, 0.918,
-             f"Frankel-Wei regression: weekly dln(CHF per SGD) on dln(CHF per currency). "
-             f"Full-sample R2 = {inference['full_r2']:.3f}, implied slope = {inference['full_implied_slope_pct']:.2f}% p.a.",
-             color=p["muted"], fontsize=9.5)
+    fig.text(0.055, 0.955,
+             f"The S$NEER basket is led by USD and EUR. FX data explains {inference['full_r2']:.0%} of weekly SGD moves",
+             color=p["white"], fontsize=20, fontweight="bold")
+    fig.text(0.055, 0.925,
+             "Frankel-Wei regression: weekly change in CHF per SGD on CHF per basket currency. "
+             "The coefficients are the implicit basket weights MAS does not publish.",
+             color=p["muted"], fontsize=10)
 
-    style_ax(ax_roll, f"Rolling {inference['window_weeks']}-Week Implied Weights (non-negative, sum to 100%)")
-    ax_roll.stackplot(stacked.index, stacked.T.values, labels=stacked.columns,
-                      colors=SERIES_COLORS[: len(stacked.columns)], alpha=0.85)
-    ax_roll.set_ylim(0, 1)
+    style_ax(ax_roll, f"How the top-5 weights changed (rolling {inference['window_weeks']}-week window)",
+             "Each point uses the two years of data ending on that date")
+    label_y = spread_labels(roll[top].iloc[-1], min_gap=0.018)
+    for color, ccy in zip(LINE_COLORS, top):
+        series = roll[ccy]
+        ax_roll.plot(series, color=color, lw=2.0)
+        ax_roll.annotate(f"{ccy} {series.iloc[-1]:.0%}", xy=(series.index[-1], series.iloc[-1]),
+                         xytext=(series.index[-1] + pd.Timedelta(days=12), label_y[ccy]),
+                         textcoords="data", color=color, fontsize=9.5, fontweight="bold", va="center")
+    ax_roll.set_ylim(0, max(0.35, roll[top].max().max() * 1.1))
+    ax_roll.set_xlim(roll.index[0], roll.index[-1] + pd.Timedelta(days=110))
     ax_roll.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
-    ax_roll.legend(loc="upper left", fontsize=8, framealpha=0.25, ncol=8)
-    ax_roll.set_xlabel("Window end date", color=p["muted"], fontsize=8)
 
-    style_ax(ax_coef, "Full-Sample OLS Weights with 95% Interval")
-    ols = inference["ols"].drop(index="const").sort_values("coef")
-    yy = np.arange(len(ols))
-    ax_coef.barh(yy, ols["coef"], xerr=1.96 * ols["se"], color=p["teal"], alpha=0.85,
-                 error_kw=dict(ecolor=p["white"], lw=0.8, capsize=2))
-    ax_coef.set_yticks(yy, ols.index)
+    style_ax(ax_coef, "Inferred weight vs hand-set guess (full sample)",
+             "Teal = inferred with 95% interval, grey = hand-set guess")
+    order = ols["coef"].sort_values().index
+    yy = np.arange(len(order))
+    ax_coef.errorbar(ols.loc[order, "coef"], yy, xerr=1.96 * ols.loc[order, "se"], fmt="none",
+                     ecolor=p["teal"], elinewidth=1.4, alpha=0.6, capsize=0)
+    ax_coef.scatter(full[order], yy, color=p["teal"], s=42, zorder=4, label="Inferred")
+    ax_coef.scatter(assumed[order], yy, color=p["muted"], s=28, marker="D", zorder=3, label="Hand-set guess")
+    ax_coef.set_yticks(yy, order)
     ax_coef.axvline(0, color="#7a8594", lw=0.9)
     ax_coef.xaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:.0%}"))
+    ax_coef.legend(loc="lower right", fontsize=8.5, framealpha=0.25)
 
-    style_ax(ax_slope, "Band Slope: Calendar Assumption vs Data-Implied (% p.a.)")
+    style_ax(ax_slope, "Band slope: assumption vs what the data implies",
+             f"% p.a.; dots = index trend within regimes of {MIN_REGIME_OBS}+ trading days")
     drift = inference["rolling_implied_slope_pct"]
-    ax_slope.plot(drift, color=p["gold"], lw=1.4, label=f"Regression drift, rolling {inference['window_weeks']}w")
     sched = slope_schedule(pd.date_range(drift.index[0], drift.index[-1], freq="D"), MPS_EVENTS, INITIAL_SLOPE)
-    ax_slope.step(sched.index, sched.values, where="post", color=p["white"], lw=1.2, ls="--",
+    ax_slope.step(sched.index, sched.values, where="post", color=p["white"], lw=1.4, ls="--",
                   label="Calendar slope assumption")
-    for _, row in regimes.dropna().iterrows():
-        start = pd.Timestamp(row["start"])
-        if start >= drift.index[0]:
-            ax_slope.scatter(start, row["implied_slope_pct"], color=p["teal"], s=22, zorder=5)
-    ax_slope.scatter([], [], color=p["teal"], s=22, label="Index trend within regime")
+    ax_slope.plot(drift, color=p["gold"], lw=1.4, alpha=0.85, label="Regression drift (rolling)")
+    long_regimes = regimes[regimes["obs"] >= MIN_REGIME_OBS].dropna()
+    for _, row in long_regimes.iterrows():
+        ax_slope.scatter(pd.Timestamp(row["start"]), row["implied_slope_pct"], color=p["teal"], s=40, zorder=5)
+    ax_slope.scatter([], [], color=p["teal"], s=40, label="Index trend in regime")
     ax_slope.axhline(0, color="#7a8594", lw=0.8)
-    ax_slope.legend(loc="upper left", fontsize=7.5, framealpha=0.18)
+    ax_slope.set_ylim(min(-1.5, drift.min() - 0.3), max(5.0, drift.max() + 0.5))
+    ax_slope.legend(loc="upper left", fontsize=8.5, framealpha=0.25)
 
     fig.text(0.055, 0.025,
-             "Rolling weights are backward-looking (window ends at the date shown). Drift = regression intercept, annualised; "
-             "it mixes the policy slope with movement inside the band, so read it as a cross-check, not the slope itself.",
-             color=p["muted"], fontsize=8)
+             "Regression drift = annualised intercept; it mixes the policy slope with movement inside the band, "
+             "so read it as a cross-check. Weights are non-negative and sum to 100% in the rolling estimate.",
+             color=p["muted"], fontsize=8.5)
     plt.savefig(INFERENCE_FILE, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     print(f"Chart saved -> {INFERENCE_FILE}")
     return fig
@@ -427,7 +486,7 @@ def main(show=True):
 
     latest_snapshot(index, returns, center, weights, assumed, inference, regimes, band, data, gap_ratio)
     plot_dashboard(data, index, returns, component_returns, center, weights, assumed, band)
-    plot_inference(inference, regimes)
+    plot_inference(inference, regimes, assumed)
     if show:
         plt.show()
 

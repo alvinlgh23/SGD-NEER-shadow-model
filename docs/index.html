@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S$NEER Shadow Model</title>
+<meta name="description" content="An interactive shadow model of Singapore's exchange-rate policy band. It reverse-engineers the S$NEER basket from FX data and lets you test the slope and band-width assumptions.">
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f3f2ee;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4;
+  --band: rgba(42, 120, 214, 0.14);
+  --band-upper: rgba(42, 120, 214, 0.10);
+  --outside-zone: rgba(208, 59, 59, 0.07);
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  --good-text: #006300;
+  --accent: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+    --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+    --band: rgba(57, 135, 229, 0.20); --band-upper: rgba(57, 135, 229, 0.12);
+    --outside-zone: rgba(230, 103, 103, 0.10);
+    --good-text: #0ca30c; --accent: #3987e5;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232321;
+  --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  --band: rgba(57, 135, 229, 0.20); --band-upper: rgba(57, 135, 229, 0.12);
+  --outside-zone: rgba(230, 103, 103, 0.10);
+  --good-text: #0ca30c; --accent: #3987e5;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page);
+  color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+.wrap { max-width: 1120px; margin: 0 auto; padding: 32px 16px 64px; }
+header .eyebrow { color: var(--muted); font-size: 13px; letter-spacing: .04em; text-transform: uppercase; font-weight: 600; }
+h1 { font-size: clamp(24px, 3.4vw, 36px); line-height: 1.2; margin: 8px 0 8px; font-weight: 700; text-wrap: balance; }
+h2 { font-size: 20px; margin: 0 0 4px; }
+h3 { font-size: 16px; margin: 0 0 4px; }
+.lede { color: var(--ink-2); max-width: 760px; margin: 0; }
+.meta { color: var(--muted); font-size: 13px; margin-top: 8px; }
+.kpis { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; margin: 24px 0; }
+.kpi { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.kpi .label { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.kpi .value { font-size: 24px; font-weight: 700; margin-top: 2px; }
+.kpi .sub { color: var(--ink-2); font-size: 12.5px; }
+.status { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; }
+.status.ok { color: var(--good-text); }
+.status.warn { color: var(--critical); }
+.status.est { color: var(--ink-2); }
+.controls { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 16px; position: sticky; top: 0; z-index: 5; }
+.controls label { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
+.controls select, .controls button, .slope-row input[type=number] {
+  font: inherit; font-size: 14px; color: var(--ink); background: var(--surface-2);
+  border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px;
+}
+.controls button { cursor: pointer; }
+.controls button:hover { border-color: var(--accent); }
+.controls output { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--ink); min-width: 44px; }
+input[type=range] { accent-color: var(--accent); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-top: 20px; }
+.card .sub { color: var(--ink-2); font-size: 13.5px; margin: 0 0 8px; }
+.chart { width: 100%; height: 420px; }
+.chart.short { height: 280px; }
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.grid-2 > .card { margin-top: 20px; }
+.slopes { width: 100%; border-collapse: collapse; font-size: 14px; }
+.slopes th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
+.slopes td { padding: 8px; border-bottom: 1px solid var(--grid); vertical-align: middle; }
+.slopes td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.slope-row input[type=range] { width: 120px; vertical-align: middle; }
+.slope-row input[type=number] { width: 72px; }
+.tag { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 1px 7px; border-radius: 99px; border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
+.tag.unverified { color: var(--critical); border-color: var(--critical); }
+.hint { color: var(--muted); font-size: 12.5px; }
+.steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 12px; }
+.step { background: var(--surface-2); border-radius: 10px; padding: 16px; }
+.step .n { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; font-size: 13px; margin-bottom: 8px; }
+.step p { margin: 4px 0 0; color: var(--ink-2); font-size: 14px; }
+table.plain { width: 100%; border-collapse: collapse; font-size: 14px; }
+table.plain th, table.plain td { text-align: left; padding: 8px; border-bottom: 1px solid var(--grid); vertical-align: top; }
+table.plain th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+table.plain td.num { font-variant-numeric: tabular-nums; text-align: right; }
+details summary { cursor: pointer; color: var(--accent); font-size: 14px; margin-top: 10px; }
+.legend-note { color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+footer { color: var(--muted); font-size: 13px; margin-top: 32px; }
+footer p { margin: 4px 0; }
+#error { display: none; background: var(--surface); border: 1px solid var(--critical); color: var(--critical); padding: 12px 16px; border-radius: 8px; margin-top: 16px; }
+@media (max-width: 900px) {
+  .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-2, .steps { grid-template-columns: 1fr; }
+  .chart { height: 340px; }
+}
+@media (max-width: 560px) {
+  .slopes .note-col { display: none; }
+  .slope-row input[type=range] { width: 84px; }
+  .controls { position: static; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Singapore dollar · shadow S$NEER model</div>
+    <h1 id="headline">Loading the latest FX data…</h1>
+    <p class="lede">MAS runs monetary policy through the exchange rate. It keeps the Singapore dollar inside a band against a basket of currencies, and never publishes the basket, the band or its slope. This page rebuilds all three from public FX data. Change the assumptions and the conclusion updates live.</p>
+    <div class="meta" id="meta"></div>
+  </header>
+
+  <div id="error"></div>
+
+  <section class="kpis" aria-label="Key figures">
+    <div class="kpi"><div class="label">Position vs centre</div><div class="value" id="k-pos">–</div><div class="sub" id="k-pos-sub"></div></div>
+    <div class="kpi"><div class="label">Room to upper edge</div><div class="value" id="k-room">–</div><div class="sub" id="k-room-sub"></div></div>
+    <div class="kpi"><div class="label">Estimated slope</div><div class="value" id="k-slope">–</div><div class="sub">pace of allowed appreciation</div></div>
+    <div class="kpi"><div class="label">Days outside band</div><div class="value" id="k-out">–</div><div class="sub" id="k-out-sub">model check: lower is better</div></div>
+    <div class="kpi"><div class="label">Next MAS review</div><div class="value" id="k-next">–</div><div class="sub">confirm on mas.gov.sg</div></div>
+  </section>
+
+  <section class="controls" aria-label="Model assumptions">
+    <label>Basket weights
+      <select id="mode"></select>
+    </label>
+    <label>Band half-width
+      <input type="range" id="band" min="1" max="3.5" step="0.25">
+      <output id="band-out" for="band"></output>
+    </label>
+    <button type="button" id="reset">Reset to defaults</button>
+    <span class="hint">Edit the slope of each policy move in the table further down.</span>
+  </section>
+
+  <section class="card">
+    <h2>The shadow S$NEER inside the estimated MAS policy band</h2>
+    <p class="sub">The band is re-centred and re-sloped on the dates MAS announced. Hover to read values. Orange marks days outside the band.</p>
+    <div id="chart-main" class="chart" role="img" aria-label="Shadow S$NEER index with the estimated policy band"></div>
+  </section>
+
+  <section class="card">
+    <h2>Where the Singapore dollar sits inside the band</h2>
+    <p class="sub">Deviation from the estimated centre, in %. The shaded area is the band. MAS normally lets the currency drift towards an edge, then holds it there.</p>
+    <div id="chart-pos" class="chart short" role="img" aria-label="Deviation from the estimated band centre over time"></div>
+  </section>
+
+  <section class="card" id="slopes-card">
+    <h2>Test the slope assumptions</h2>
+    <p class="sub">MAS says only the <em>direction</em> of each change ("slightly", "very slightly"), never the number. The defaults are rough bank-research estimates. "Data-implied" is the index's own trend within each regime; it is noisy when a regime is short or the currency is moving between edges.</p>
+    <table class="slopes">
+      <thead><tr><th>Date</th><th>MAS move</th><th class="note-col">What MAS said</th><th>Slope after (% p.a.)</th><th>Data-implied</th></tr></thead>
+      <tbody id="slope-rows"></tbody>
+    </table>
+  </section>
+
+  <div class="grid-2">
+    <section class="card">
+      <h2>What the basket looks like</h2>
+      <p class="sub">Full-sample weights inferred from FX data (dots with 95% interval), compared with a typical hand-set guess (diamonds).</p>
+      <div id="chart-weights" class="chart" role="img" aria-label="Inferred basket weights compared with hand-set guess"></div>
+      <details>
+        <summary>Show weights as a table</summary>
+        <table class="plain" id="weights-table"></table>
+      </details>
+    </section>
+    <section class="card">
+      <h2>How the biggest weights changed</h2>
+      <p class="sub" id="roll-sub">Rolling two-year window. Each point uses the data ending on that date.</p>
+      <div id="chart-roll" class="chart" role="img" aria-label="Rolling inferred weights for the five largest currencies"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>Slope cross-check</h2>
+    <p class="sub">Your slope assumptions (step line) against the slope implied by the regression's drift term. The drift also picks up movement inside the band, so use it as a sanity check, not as the answer.</p>
+    <div id="chart-slope" class="chart short" role="img" aria-label="Assumed slope schedule compared with regression drift"></div>
+  </section>
+
+  <section class="card">
+    <h2>How MAS policy works, in three steps</h2>
+    <div class="steps">
+      <div class="step"><span class="n">1</span><h3>A basket</h3><p>The Singapore dollar is measured against a trade-weighted basket of its main partners' currencies: the S$NEER. MAS does not publish the weights.</p></div>
+      <div class="step"><span class="n">2</span><h3>A band</h3><p>MAS keeps the S$NEER inside an undisclosed band around a centre line. It intervenes in the FX market when the currency approaches an edge.</p></div>
+      <div class="step"><span class="n">3</span><h3>A slope</h3><p>The band rises over time. A steeper slope means faster appreciation, which is tighter policy that leans against imported inflation. Policy changes adjust the slope, width or centre.</p></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>What is verified and what is estimated</h2>
+    <table class="plain">
+      <thead><tr><th>Item</th><th>Status</th><th>Source / method</th></tr></thead>
+      <tbody>
+        <tr><td>Dates and direction of policy moves</td><td><span class="status ok">✓ Verified</span></td><td>MAS Monetary Policy Statements (except rows tagged "unverified" in the slope table)</td></tr>
+        <tr><td>Basket weights</td><td><span class="status est">≈ Estimated</span></td><td>Frankel-Wei regression: weekly returns, CHF numeraire, 12 currencies</td></tr>
+        <tr><td>Slope of each regime</td><td><span class="status est">≈ Estimated</span></td><td>Bank-research style assumptions; you can edit them above</td></tr>
+        <tr><td>Band width (±2% default)</td><td><span class="status est">≈ Estimated</span></td><td>Common market estimate; MAS does not disclose it</td></tr>
+        <tr><td>Centre level</td><td><span class="status est">≈ Estimated</span></td><td>Re-centred to the prevailing index level on MAS re-centring dates</td></tr>
+        <tr><td>FX prices</td><td><span class="status ok">✓ Observed</span></td><td>Yahoo Finance daily closes. Restricted currencies (CNY, KRW, TWD, INR, IDR) can be stale</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p id="fit-note"></p>
+    <p>Method: chain-linked geometric index of 12 SGD crosses. Basket weights come from a rolling Frankel-Wei regression, applied with a one-day lag. The band is rebuilt from the MAS policy calendar.</p>
+    <p>An independent research project, not affiliated with MAS. This is not investment advice.</p>
+  </footer>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/plotly.js-basic-dist-min@2.35.2/plotly-basic.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
